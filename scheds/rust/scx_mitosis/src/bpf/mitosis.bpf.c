@@ -90,6 +90,14 @@ static inline struct cgroup *lookup_cgrp_ancestor(struct cgroup *cgrp,
 }
 
 struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);
+	__type(value, u32);
+	__uint(max_entries, 1000);
+	__uint(map_flags, 0);
+} cgrp_init_cell_assignment SEC(".maps");
+
+struct {
 	__uint(type, BPF_MAP_TYPE_CGRP_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, int);
@@ -99,6 +107,7 @@ struct {
 static inline struct cgrp_ctx *lookup_cgrp_ctx(struct cgroup *cgrp)
 {
 	struct cgrp_ctx *cgc;
+	int ret;
 
 	if (!(cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0))) {
 		scx_bpf_error("cgrp_ctx lookup failed for cgid %llu",
@@ -328,11 +337,7 @@ static __always_inline int critical_section_poll()
 volatile bool update_cell_assignment;
 bool draining;
 
-/*
- * This is the main driver for reconfiguration. It only runs on CPU 0
- */
-SEC("fentry")
-int BPF_PROG(sched_tick_fentry)
+static void reconfigure()
 {
 	int cell_idx, cpu_idx;
 	struct cpu_ctx *cpu_ctx;
@@ -341,43 +346,6 @@ int BPF_PROG(sched_tick_fentry)
 	struct cgroup_subsys_state *root_css, *pos;
 	struct cgroup *root_cgrp;
 
-	if (bpf_get_smp_processor_id() != 0)
-		return 0;
-
-	/*
-	 * To handle races where tasks are assigned to cells that are getting
-	 * removed, we ensure cpus dispatch from their previous cell for an entire
-	 * scheduler tick. This is a crude way of mimicing RCU synchronization.
-	 */
-	if (READ_ONCE(draining)) {
-		if (critical_section_poll())
-			return 0;
-		/* FIXME: If a cell is being destroyed, we need to make sure that dsq is
-		 * drained before removing it from all the cpus
-		 *
-		 * Additionally, the handling of pinned tasks is broken here - we send
-		 * them to a cell DSQ if there's overlap of the cell's CPUs and the
-		 * task's cpumask but if the cell's CPU change we might stall the
-		 * task indefinitely.
-		 */
-		bpf_for(cpu_idx, 0, nr_possible_cpus)
-		{
-			if (!(cpu_ctx = lookup_cpu_ctx(cpu_idx)))
-				return 0;
-
-			cpu_ctx->prev_cell = cpu_ctx->cell;
-		}
-		barrier();
-		WRITE_ONCE(draining, false);
-	}
-
-	if (global_seq == READ_ONCE(user_global_seq))
-		return 0;
-
-	/* There's a debug check in select_cpu that checks for the !draining
-	   condition, make sure it's synchronized with the store here */
-	WRITE_ONCE(draining, true);
-	barrier();
 	/* Iterate through each cell and create its cpumask according to what
 	   userspace says */
 	bpf_for(cell_idx, 0, MAX_CELLS)
@@ -385,13 +353,13 @@ int BPF_PROG(sched_tick_fentry)
 		if (!(cell_cpumaskw =
 			      bpf_map_lookup_elem(&cell_cpumasks, &cell_idx))) {
 			scx_bpf_error("Failed to find cell cpumask");
-			return 0;
+			return;
 		}
 
 		cpumask = bpf_kptr_xchg(&cell_cpumaskw->tmp_cpumask, NULL);
 		if (!cpumask) {
 			scx_bpf_error("tmp_cpumask should never be null");
-			return 0;
+			return;
 		}
 		bpf_cpumask_clear(cpumask);
 
@@ -406,7 +374,7 @@ int BPF_PROG(sched_tick_fentry)
 					if (!(cpu_ctx = lookup_cpu_ctx(
 						      cpu_idx))) {
 						bpf_cpumask_release(cpumask);
-						return 0;
+						return;
 					}
 
 					cpu_ctx->cell = cell_idx;
@@ -416,21 +384,21 @@ int BPF_PROG(sched_tick_fentry)
 		cpumask = bpf_kptr_xchg(&cell_cpumaskw->cpumask, cpumask);
 		if (!cpumask) {
 			scx_bpf_error("cpumask should never be null");
-			return 0;
+			return;
 		}
 		cpumask = bpf_kptr_xchg(&cell_cpumaskw->tmp_cpumask, cpumask);
 		/* We just xchg'd NULL into it, so tmp_cpumask should be NULL */
 		if (cpumask) {
 			scx_bpf_error("tmp_cpumask should be null");
 			bpf_cpumask_release(cpumask);
-			return 0;
+			return;
 		}
 	}
 
 	if (update_cell_assignment) {
 		if (!(root_cgrp = bpf_cgroup_from_id(1))) {
 			scx_bpf_error("Could not get rootcg");
-			return 0;
+			return;
 		}
 
 		root_css = &root_cgrp->self;
@@ -489,7 +457,7 @@ int BPF_PROG(sched_tick_fentry)
 					continue;
 
 				if (!(parent_cg =
-					      lookup_cgrp_ancestor(cg, 1))) {
+					      lookup_cgrp_ancestor(cg, cg->level - 1))) {
 					bpf_cgroup_release(cg);
 					break;
 				}
@@ -514,7 +482,87 @@ int BPF_PROG(sched_tick_fentry)
 		bpf_cgroup_release(root_cgrp);
 		update_cell_assignment = false;
 	}
+}
 
+static int account_usage(struct task_struct *p)
+{
+	struct cpu_ctx *cctx;
+	struct task_ctx *tctx;
+	struct cell *cell;
+	u64 now, used;
+	u32 cidx;
+
+	if (!(cctx = lookup_cpu_ctx(-1)) || !(tctx = lookup_task_ctx(p)))
+		return -1;
+
+	cidx = tctx->cell;
+	if (!(cell = lookup_cell(cidx)))
+		return -1;
+
+	now = scx_bpf_now();
+	used = now - tctx->started_running_at;
+	tctx->started_running_at = now;
+	/* scale the execution time by the inverse of the weight and charge */
+	p->scx.dsq_vtime += used * 100 / p->scx.weight;
+
+	u64 *cell_cycles = MEMBER_VPTR(cctx->cell_cycles, [cidx]);
+	if (!cell_cycles) {
+		scx_bpf_error("Cell index is too large: %d", cidx);
+		return -1;
+	}
+	*cell_cycles += used;
+	return 0;
+}
+
+/*
+ * This is the main driver for reconfiguration. It only runs on CPU 0
+ */
+void BPF_STRUCT_OPS(mitosis_tick, struct task_struct *p_run)
+{
+	int cpu_idx;
+	struct cpu_ctx *cpu_ctx;
+
+	if (p_run && account_usage(p_run) < 0)
+		return;
+
+	if (bpf_get_smp_processor_id() != 0)
+		return;
+
+	/*
+	 * To handle races where tasks are assigned to cells that are getting
+	 * removed, we ensure cpus dispatch from their previous cell for an entire
+	 * scheduler tick. This is a crude way of mimicing RCU synchronization.
+	 */
+	if (READ_ONCE(draining)) {
+		if (critical_section_poll())
+			return;
+		/* FIXME: If a cell is being destroyed, we need to make sure that dsq is
+		 * drained before removing it from all the cpus
+		 *
+		 * Additionally, the handling of pinned tasks is broken here - we send
+		 * them to a cell DSQ if there's overlap of the cell's CPUs and the
+		 * task's cpumask but if the cell's CPU change we might stall the
+		 * task indefinitely.
+		 */
+		bpf_for(cpu_idx, 0, nr_possible_cpus)
+		{
+			if (!(cpu_ctx = lookup_cpu_ctx(cpu_idx)))
+				return;
+
+			cpu_ctx->prev_cell = cpu_ctx->cell;
+		}
+		barrier();
+		WRITE_ONCE(draining, false);
+	}
+
+	if (global_seq == READ_ONCE(user_global_seq))
+		return;
+
+	/* There's a debug check in select_cpu that checks for the !draining
+	   condition, make sure it's synchronized with the store here */
+	WRITE_ONCE(draining, true);
+	barrier();
+	reconfigure();
 	/* Bump the global seq last to ensure that prior stores are now visible. This synchronizes with the read of global_seq */
 	barrier();
 	WRITE_ONCE(global_seq, global_seq + 1);
@@ -523,7 +571,7 @@ int BPF_PROG(sched_tick_fentry)
 	 * we can clear the prev_cell for each cpu. Record the state here.
 	 */
 	critical_section_record();
-	return 0;
+	return;
 }
 
 static void cstat_add(enum cell_stat_idx idx, u32 cell, struct cpu_ctx *cctx,
@@ -712,6 +760,10 @@ s32 BPF_STRUCT_OPS(mitosis_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if (!(cctx = lookup_cpu_ctx(-1)) || !(tctx = lookup_task_ctx(p)))
 		return prev_cpu;
 
+	if (!all_cpumask || !tctx->cpumask) {
+		scx_bpf_error("null");
+		return prev_cpu;
+	}
 	/*
 	 * This is a lightweight (RCU-like) critical section covering from when we
 	 * refresh cell information to when we enqueue onto the task's assigned
@@ -730,8 +782,8 @@ s32 BPF_STRUCT_OPS(mitosis_select_cpu, struct task_struct *p, s32 prev_cpu,
 		if (debug && !READ_ONCE(draining) && tctx->all_cpus_allowed &&
 		    (cctx = lookup_cpu_ctx(cpu)) && cctx->cell != tctx->cell)
 			scx_bpf_error(
-				"select_cpu returned cpu %d belonging to cell %d but task belongs to cell %d",
-				cpu, cctx->cell, tctx->cell);
+				"select_cpu returned cpu %d belonging to cell %d but task belongs to cell %d, prev_cpu %d",
+				cpu, cctx->cell, tctx->cell, prev_cpu);
 		goto out;
 	}
 
@@ -836,37 +888,6 @@ void BPF_STRUCT_OPS(mitosis_dispatch, s32 cpu, struct task_struct *prev)
 	scx_bpf_dsq_move_to_local(LO_FALLBACK_DSQ);
 }
 
-static inline void runnable(struct task_struct *p, struct task_ctx *tctx,
-			    struct cgroup *cgrp)
-{
-	struct cgrp_ctx *cgc;
-
-	if (tctx->cell == -1) {
-		if (!(cgc = lookup_cgrp_ctx(cgrp)))
-			return;
-
-		tctx->cell = cgc->cell;
-	}
-
-	adj_load(p, tctx, cgrp, p->scx.weight, scx_bpf_now());
-}
-
-void BPF_STRUCT_OPS(mitosis_runnable, struct task_struct *p, u64 enq_flags)
-{
-	struct cgroup *cgrp;
-	struct task_ctx *tctx;
-
-	if (!(cgrp = task_cgroup(p)))
-		return;
-
-	if (!(tctx = lookup_task_ctx(p)))
-		goto out;
-
-	runnable(p, tctx, cgrp);
-out:
-	bpf_cgroup_release(cgrp);
-}
-
 void BPF_STRUCT_OPS(mitosis_running, struct task_struct *p)
 {
 	struct task_ctx *tctx;
@@ -883,56 +904,14 @@ void BPF_STRUCT_OPS(mitosis_running, struct task_struct *p)
 
 void BPF_STRUCT_OPS(mitosis_stopping, struct task_struct *p, bool runnable)
 {
-	struct cpu_ctx *cctx;
-	struct task_ctx *tctx;
-	struct cell *cell;
-	u64 used;
-	u32 cidx;
-
-	if (!(cctx = lookup_cpu_ctx(-1)) || !(tctx = lookup_task_ctx(p)))
-		return;
-
-	cidx = tctx->cell;
-	if (!(cell = lookup_cell(cidx)))
-		return;
-
-	used = scx_bpf_now() - tctx->started_running_at;
-	/* scale the execution time by the inverse of the weight and charge */
-	p->scx.dsq_vtime += used * 100 / p->scx.weight;
-
-	if (tctx->all_cpus_allowed) {
-		u64 *cell_cycles = MEMBER_VPTR(cctx->cell_cycles, [cidx]);
-		if (!cell_cycles) {
-			scx_bpf_error("Cell index is too large: %d", cidx);
-			return;
-		}
-		*cell_cycles += used;
-	}
-}
-
-static inline void quiescent(struct task_struct *p, struct cgroup *cgrp)
-{
-	struct task_ctx *tctx;
-	if (!(tctx = lookup_task_ctx(p)))
-		return;
-
-	adj_load(p, tctx, cgrp, -(s64)p->scx.weight, scx_bpf_now());
-}
-
-void BPF_STRUCT_OPS(mitosis_quiescent, struct task_struct *p, u64 deq_flags)
-{
-	struct cgroup *cgrp;
-	if (!(cgrp = task_cgroup(p)))
-		return;
-
-	quiescent(p, cgrp);
-	bpf_cgroup_release(cgrp);
+	account_usage(p);
 }
 
 s32 BPF_STRUCT_OPS(mitosis_cgroup_init, struct cgroup *cgrp,
 		   struct scx_cgroup_init_args *args)
 {
 	struct cgrp_ctx *cgc;
+	int *cell;
 	if (!(cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0,
 					 BPF_LOCAL_STORAGE_GET_F_CREATE))) {
 		scx_bpf_error("cgrp_ctx creation failed for cgid %llu",
@@ -948,14 +927,64 @@ s32 BPF_STRUCT_OPS(mitosis_cgroup_init, struct cgroup *cgrp,
 		return -ENOENT;
 	}
 
-	// Initialize the rootcg to cell 0
-	if (!cgrp->level) {
-		cgc->cell = 0;
+	u64 cgid = cgrp->kn->id;
+	if ((cell = bpf_map_lookup_elem(&cgrp_init_cell_assignment, &cgid))) {
+		int cpu_idx;
+		struct cpu_ctx *cpu_ctx;
+		struct bpf_cpumask *cpumask;
+		struct cell_cpumask_wrapper *cell_cpumaskw;
+
+		cgc->cell = *cell;
+		if (!(cell_cpumaskw =
+			  bpf_map_lookup_elem(&cell_cpumasks, cell))) {
+			scx_bpf_error("Failed to find cell cpumask");
+			return -ENOENT;
+		}
+
+		cpumask = bpf_kptr_xchg(&cell_cpumaskw->tmp_cpumask, NULL);
+		if (!cpumask) {
+			scx_bpf_error("tmp_cpumask should never be null");
+			return -ENOENT;
+		}
+		bpf_cpumask_clear(cpumask);
+		bpf_for(cpu_idx, 0, nr_possible_cpus)
+		{
+			u8 *u8_ptr;
+
+			if ((u8_ptr = MEMBER_VPTR(
+				     cells, [*cell].cpus[cpu_idx / 8]))) {
+				if (*u8_ptr & (1 << (cpu_idx % 8))) {
+					bpf_cpumask_set_cpu(cpu_idx, cpumask);
+					if (!(cpu_ctx = lookup_cpu_ctx(
+						      cpu_idx))) {
+						bpf_cpumask_release(cpumask);
+						return -ENOENT;
+					}
+
+					cpu_ctx->cell = *cell;
+				}
+			}
+		}
+		if (all_cpumask && bpf_cpumask_subset((const struct cpumask *)all_cpumask, cpumask))
+			scx_bpf_error("cell cpumask is all cpus");
+		cpumask = bpf_kptr_xchg(&cell_cpumaskw->cpumask, cpumask);
+		if (!cpumask) {
+			scx_bpf_error("cpumask should never be null");
+			return -ENOENT;
+		}
+		cpumask = bpf_kptr_xchg(&cell_cpumaskw->tmp_cpumask, cpumask);
+		/* We just xchg'd NULL into it, so tmp_cpumask should be NULL */
+		if (cpumask) {
+			scx_bpf_error("tmp_cpumask should be null");
+			bpf_cpumask_release(cpumask);
+			return -ENOENT;
+		}
+
 		return 0;
 	}
 
 	struct cgroup *parent_cg;
-	if (!(parent_cg = lookup_cgrp_ancestor(cgrp, 1)))
+	if (!(parent_cg = lookup_cgrp_ancestor(cgrp, cgrp->level - 1)))
 		return -ENOENT;
 
 	struct cgrp_ctx *parent_cgc;
@@ -977,11 +1006,6 @@ void BPF_STRUCT_OPS(mitosis_cgroup_move, struct task_struct *p,
 
 	if (!(tctx = lookup_task_ctx(p)))
 		return;
-
-	if (p->scx.flags & SCX_TASK_QUEUED) {
-		quiescent(p, from);
-		runnable(p, tctx, to);
-	}
 
 	update_task_cell(p, tctx, to);
 }
@@ -1026,16 +1050,16 @@ s32 BPF_STRUCT_OPS(mitosis_init_task, struct task_struct *p,
 	if (cpumask) {
 		/* Should never happen as we just inserted it above. */
 		bpf_cpumask_release(cpumask);
+		scx_bpf_error("tctx cpumask is unexpectedly populated on init");
 		return -EINVAL;
 	}
 
-	if (all_cpumask)
-		tctx->all_cpus_allowed = bpf_cpumask_subset(
-			(const struct cpumask *)all_cpumask, p->cpus_ptr);
-	else {
+	if (!all_cpumask) {
 		scx_bpf_error("missing all_cpumask");
 		return -EINVAL;
 	}
+	tctx->all_cpus_allowed = bpf_cpumask_subset(
+												(const struct cpumask *)all_cpumask, p->cpus_ptr);
 
 	if ((ret = update_task_cell(p, tctx, args->cgroup))) {
 		return ret;
@@ -1097,14 +1121,14 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mitosis_init)
 			return -ENOMEM;
 
 		/*
-		 * Start with all full cpumask for all cells. It only matters for cell 0
-		 * to start with, all others will get reconfigured by userspace before
-		 * being used.
+		 * Start with all full cpumask for all cells. They'll get setup in
+		 * cgroup_init
 		 */
 		bpf_cpumask_setall(cpumask);
 
 		cpumask = bpf_kptr_xchg(&cpumaskw->cpumask, cpumask);
 		if (cpumask) {
+			/* Should be impossible, we just initialized the cell cpumask */
 			bpf_cpumask_release(cpumask);
 			return -EINVAL;
 		}
@@ -1114,6 +1138,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mitosis_init)
 			return -ENOMEM;
 		cpumask = bpf_kptr_xchg(&cpumaskw->tmp_cpumask, cpumask);
 		if (cpumask) {
+			/* Should be impossible, we just initialized the cell tmp_cpumask */
 			bpf_cpumask_release(cpumask);
 			return -EINVAL;
 		}
@@ -1132,10 +1157,9 @@ struct sched_ext_ops mitosis = {
 	.select_cpu = (void *)mitosis_select_cpu,
 	.enqueue = (void *)mitosis_enqueue,
 	.dispatch = (void *)mitosis_dispatch,
-	.runnable = (void *)mitosis_runnable,
+	.tick = (void *)mitosis_tick,
 	.running = (void *)mitosis_running,
 	.stopping = (void *)mitosis_stopping,
-	.quiescent = (void *)mitosis_quiescent,
 	.set_cpumask = (void *)mitosis_set_cpumask,
 	.init_task = (void *)mitosis_init_task,
 	.cgroup_init = (void *)mitosis_cgroup_init,
