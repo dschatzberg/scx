@@ -81,6 +81,11 @@ unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
 }
 
 #[derive(Debug)]
+// A `Cell` is a dynamic collection of CPUs. There is no limitation of the
+// number of tasks that can be assigned to a given `Cell`. The bpf layer
+// generates cpu bitmask using the assignments described by the cell. Cells are
+// an accounting domain, and we expect the union of all non-root cell cpus to
+// be the cpus of the root cell.
 struct Cell {
     cpu_assignment: BTreeSet<u32>,
 }
@@ -192,8 +197,8 @@ impl<'a> Scheduler<'a> {
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
+        self.update_bpf_cells()?;
         self.update_cgroup_to_cell_assignment()?;
-        self.assign_cpus()?;
         let _struct_ops = scx_ops_attach!(self.skel, mitosis)?;
         info!("Mitosis Scheduler Attached");
         while !shutdown.load(Ordering::Relaxed) && !uei_exited!(&self.skel, uei) {
@@ -238,7 +243,7 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    fn assign_cpus(&mut self) -> Result<()> {
+    fn update_bpf_cells(&mut self) -> Result<()> {
         for (cell_idx, cell) in self.cells.iter() {
             for cpu in cell.cpu_assignment.iter() {
                 trace!("Assigned CPU {} to Cell {}", cpu, cell_idx);
