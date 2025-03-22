@@ -38,10 +38,10 @@ use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
 use scx_utils::uei_exited;
 use scx_utils::uei_report;
+use scx_utils::Topology;
 use scx_utils::UserExitInfo;
 use scx_utils::NR_CPUS_POSSIBLE;
 use scx_utils::NR_CPU_IDS;
-use scx_utils::Topology;
 
 const MAX_CELLS: usize = bpf_intf::consts_MAX_CELLS as usize;
 
@@ -120,7 +120,12 @@ impl<'a> Scheduler<'a> {
         let mut cells: BTreeMap<u32, Cell> = BTreeMap::new();
         let mut num_cells = 1;
         let mut root_cell = Cell {
-                cpu_assignment: topology.all_cpus.keys().cloned().map(|x| x as u32).collect(),
+            cpu_assignment: topology
+                .all_cpus
+                .keys()
+                .cloned()
+                .map(|x| x as u32)
+                .collect(),
         };
         let mut cgroup_to_cell = hashmap! {
             "".to_string() => 0
@@ -138,22 +143,38 @@ impl<'a> Scheduler<'a> {
             let cpuset = match reader.read_cpuset_cpus() {
                 Err(cgroupfs::Error::IoError(_, e)) if e.kind() == std::io::ErrorKind::NotFound => {
                     continue;
-                },
+                }
                 r => r,
-            }.with_context(|| format!("Error while reading cpuset from {}", reader.name().display()))?;
+            }
+            .with_context(|| {
+                format!(
+                    "Error while reading cpuset from {}",
+                    reader.name().display()
+                )
+            })?;
             if !cpuset.cpus.is_empty() {
-                trace!("Cgroup {} has non-empty cpuset: {}", reader.name().display(), cpuset);
+                trace!(
+                    "Cgroup {} has non-empty cpuset: {}",
+                    reader.name().display(),
+                    cpuset
+                );
                 let cg_name = reader.name().to_string_lossy().to_string();
                 if !cpuset.cpus.is_subset(&root_cell.cpu_assignment) {
-                    bail!("cpuset of cgroup {} ({:?}) is not a subset of the root cell cpus ({:?})",
-                    reader.name().display(), cpuset.cpus, root_cell.cpu_assignment);
+                    bail!(
+                        "cpuset of cgroup {} ({:?}) is not a subset of the root cell cpus ({:?})",
+                        reader.name().display(),
+                        cpuset.cpus,
+                        root_cell.cpu_assignment
+                    );
                 }
-                root_cell.cpu_assignment.retain(|x| !cpuset.cpus.contains(x));
+                root_cell
+                    .cpu_assignment
+                    .retain(|x| !cpuset.cpus.contains(x));
                 cells.insert(
                     num_cells,
                     Cell {
                         cpu_assignment: cpuset.cpus,
-                    }
+                    },
                 );
                 cgroup_to_cell.insert(cg_name, num_cells);
                 num_cells += 1;
@@ -198,11 +219,20 @@ impl<'a> Scheduler<'a> {
             self.skel
                 .maps
                 .cgrp_init_cell_assignment
-                .update(cg_inode_slice, cell_idx_slice, libbpf_rs::MapFlags::NO_EXIST)
+                .update(
+                    cg_inode_slice,
+                    cell_idx_slice,
+                    libbpf_rs::MapFlags::NO_EXIST,
+                )
                 .with_context(|| {
                     format!("Failed to update cgroup cell assignment for: {}", cg_path)
                 })?;
-            trace!("Assigned {} with inode {} to {}", cgroup, cg_inode, cell_idx);
+            trace!(
+                "Assigned {} with inode {} to {}",
+                cgroup,
+                cg_inode,
+                cell_idx
+            );
         }
         self.skel.maps.bss_data.update_cell_assignment = true;
         Ok(())
