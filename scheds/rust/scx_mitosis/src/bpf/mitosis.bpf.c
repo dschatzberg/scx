@@ -101,8 +101,8 @@ struct task_ctx {
 	u32 cell;
 	// latest configuration that was applied for this task (to know if it has to be re-applied)
 	u32 configuration_seq;
-	// Is this task allowed on all cores?
-	bool all_cpus_allowed;
+	// Is this task allowed on all cores of its cell?
+	bool all_cell_cpus_allowed;
 };
 
 struct {
@@ -358,6 +358,9 @@ static inline int update_task_cpumask(struct task_struct *p,
 		return -EINVAL;
 
 	bpf_cpumask_and(tctx->cpumask, cell_cpumask, p->cpus_ptr);
+
+	if (cell_cpumask)
+		tctx->all_cell_cpus_allowed = bpf_cpumask_subset(cell_cpumask, p->cpus_ptr);
 	return 0;
 }
 
@@ -587,10 +590,7 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 
 	if (p->flags & PF_KTHREAD && p->nr_cpus_allowed == 1) {
 		scx_bpf_dsq_insert(p, HI_FALLBACK_DSQ, slice_ns, 0);
-	} else if (!tctx->all_cpus_allowed) {
-		// FIXME: With cpusets, most schedules will fall into this section and
-		// not actually get distributed to the correct cell. We need to loosen
-		// the check on tctx->all_cpus_allowed
+	} else if (!tctx->all_cell_cpus_allowed) {
 		scx_bpf_dsq_insert(p, LO_FALLBACK_DSQ, slice_ns, 0);
 	} else {
 		scx_bpf_dsq_insert_vtime(p, tctx->cell, slice_ns, vtime,
@@ -760,7 +760,7 @@ void BPF_STRUCT_OPS(mitosis_stopping, struct task_struct *p, bool runnable)
 	/* scale the execution time by the inverse of the weight and charge */
 	p->scx.dsq_vtime += used * 100 / p->scx.weight;
 
-	if (cidx != 0 || tctx->all_cpus_allowed) {
+	if (cidx != 0 || tctx->all_cell_cpus_allowed) {
 		u64 *cell_cycles = MEMBER_VPTR(cctx->cell_cycles, [cidx]);
 		if (!cell_cycles) {
 			scx_bpf_error("Cell index is too large: %d", cidx);
@@ -1036,8 +1036,6 @@ void BPF_STRUCT_OPS(mitosis_set_cpumask, struct task_struct *p,
 		return;
 	}
 
-	tctx->all_cpus_allowed = bpf_cpumask_subset(
-		(const struct cpumask *)all_cpumask, cpumask);
 	update_task_cpumask(p, tctx);
 }
 
@@ -1071,8 +1069,6 @@ s32 BPF_STRUCT_OPS(mitosis_init_task, struct task_struct *p,
 		scx_bpf_error("missing all_cpumask");
 		return -EINVAL;
 	}
-	tctx->all_cpus_allowed = bpf_cpumask_subset(
-		(const struct cpumask *)all_cpumask, p->cpus_ptr);
 
 	if ((ret = update_task_cell(p, tctx, args->cgroup))) {
 		return ret;
