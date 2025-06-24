@@ -93,15 +93,17 @@ static inline struct cgroup *task_cgroup(struct task_struct *p)
  * task_ctx is the per-task information kept by scx_mitosis
 */
 struct task_ctx {
-	// cpumask is the set of valid cpus this task can schedule on (tasks cpumask anded with its cell cpumask)
+	/* cpumask is the set of valid cpus this task can schedule on */
+	/* (tasks cpumask anded with its cell cpumask) */
 	struct bpf_cpumask __kptr *cpumask;
-	// started_running_at for recording runtime
+	/* started_running_at for recording runtime */
 	u64 started_running_at;
-	// cell assignment
+	/* cell assignment */
 	u32 cell;
-	// latest configuration that was applied for this task (to know if it has to be re-applied)
+	/* latest configuration that was applied for this task */
+	/* (to know if it has to be re-applied) */
 	u32 configuration_seq;
-	// Is this task allowed on all cores of its cell?
+	/* Is this task allowed on all cores of its cell? */
 	bool all_cell_cpus_allowed;
 };
 
@@ -360,7 +362,8 @@ static inline int update_task_cpumask(struct task_struct *p,
 	bpf_cpumask_and(tctx->cpumask, cell_cpumask, p->cpus_ptr);
 
 	if (cell_cpumask)
-		tctx->all_cell_cpus_allowed = bpf_cpumask_subset(cell_cpumask, p->cpus_ptr);
+		tctx->all_cell_cpus_allowed =
+			bpf_cpumask_subset(cell_cpumask, p->cpus_ptr);
 	return 0;
 }
 
@@ -510,7 +513,8 @@ s32 BPF_STRUCT_OPS(mitosis_select_cpu, struct task_struct *p, s32 prev_cpu,
 		goto out;
 	}
 
-	if (tctx->cpumask && bpf_cpumask_empty((const struct cpumask *)tctx->cpumask)) {
+	if (tctx->cpumask &&
+	    bpf_cpumask_empty((const struct cpumask *)tctx->cpumask)) {
 		/*
 		 * This is an affinity violation (no overlap between task cpus and cell
 		 * cpus) but we also failed to find an idle cpu in the task cpus. No
@@ -530,8 +534,11 @@ s32 BPF_STRUCT_OPS(mitosis_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 * All else failed, send it to the prev cpu (if that's valid), otherwise any
 	 * valid cpu.
 	 */
-	if (!bpf_cpumask_test_cpu(prev_cpu, (const struct cpumask *)tctx->cpumask) && tctx->cpumask)
-		cpu = bpf_cpumask_any_distribute((const struct cpumask *)tctx->cpumask);
+	if (!bpf_cpumask_test_cpu(prev_cpu,
+				  (const struct cpumask *)tctx->cpumask) &&
+	    tctx->cpumask)
+		cpu = bpf_cpumask_any_distribute(
+			(const struct cpumask *)tctx->cpumask);
 	else
 		cpu = prev_cpu;
 
@@ -1106,12 +1113,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mitosis_init)
 	bpf_for(i, 0, MAX_CELLS)
 	{
 		struct cell_cpumask_wrapper *cpumaskw;
-		struct cell *cell = &cells[i];
 
 		ret = scx_bpf_create_dsq(i, -1);
 		if (ret < 0)
 			return ret;
-		cell->dsq = i;
 
 		if (!(cpumaskw = bpf_map_lookup_elem(&cell_cpumasks, &i)))
 			return -ENOENT;
