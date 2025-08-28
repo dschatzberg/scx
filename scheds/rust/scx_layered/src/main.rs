@@ -124,6 +124,7 @@ lazy_static! {
                     cpus_range: Some((0, 16)),
                     cpus_range_frac: None,
                     protected: false,
+                    membw_gb: None,
                     common: LayerCommon {
                         min_exec_us: 1000,
                         yield_ignore: 0.0,
@@ -198,6 +199,7 @@ lazy_static! {
                     util_range: (0.2, 0.8),
                     protected: false,
                     cpus_range_frac: None,
+                    membw_gb: None,
                     common: LayerCommon {
                         min_exec_us: 800,
                         yield_ignore: 0.0,
@@ -235,6 +237,7 @@ lazy_static! {
                     util_includes_open_cputime: true,
                     protected: false,
                     cpus_range_frac: None,
+                    membw_gb: None,
                     common: LayerCommon {
                         min_exec_us: 200,
                         yield_ignore: 0.0,
