@@ -2033,6 +2033,6 @@ SCX_OPS_DEFINE(lavd_ops,
 	       .cgroup_set_bandwidth	= (void *)lavd_cgroup_set_bandwidth,
 	       .init			= (void *)lavd_init,
 	       .exit			= (void *)lavd_exit,
-	       .timeout_ms		= 30000U,
+	       .timeout_ms		= 3000U,
 	       .name			= "lavd");
 
