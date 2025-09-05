@@ -11,6 +11,7 @@ fn main() {
         .add_source("../../../lib/atq.bpf.c")
         .add_source("../../../lib/cgroup_bw.bpf.c")
         .add_source("../../../lib/minheap.bpf.c")
+        .add_source("../../../lib/rbtree.bpf.c")
         .add_source("../../../lib/sdt_alloc.bpf.c")
         .compile_link_gen()
         .unwrap();

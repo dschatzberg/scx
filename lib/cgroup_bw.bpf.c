@@ -609,14 +609,20 @@ int scx_cgroup_bw_set(struct cgroup *cgrp __arg_trusted, u64 period_us, u64 quot
 	bpf_rcu_read_lock();
 	subroot_css = &cgrp->self;
 	bpf_for_each(css, pos, subroot_css, BPF_CGROUP_ITER_DESCENDANTS_PRE) {
-		cur_cgrp = pos->cgroup;
+		cur_cgrp = bpf_cgroup_from_id(pos->cgroup->kn->id);
+		if (!cur_cgrp) {
+			cbw_err("foo");
+			goto unlock_out;
+		}
 		cur_cgx = cbw_get_cgroup_ctx(cur_cgrp);
 		if (!cur_cgx) {
+			bpf_cgroup_release(cur_cgrp);
 			cbw_err("Failed to lookup a cgroup ctx");
 			goto unlock_out;
 		}
 
 		ret = cbw_update_nquota_ub(cur_cgrp, cur_cgx);
+		bpf_cgroup_release(cur_cgrp);
 		if (ret)
 			goto unlock_out;
 	}
