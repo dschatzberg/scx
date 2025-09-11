@@ -516,8 +516,7 @@ int scx_cgroup_bw_init(struct cgroup *cgrp __arg_trusted, struct scx_cgroup_init
 		return -ENOMEM;
 	}
 
-	cbw_set_bandwidth(cgrp, cgx, args->bw_period_us, args->bw_quota_us,
-			  args->bw_burst_us);
+	cbw_set_bandwidth(cgrp, cgx, 100000, CBW_RUNTUME_INF, 0);
 	cbw_update_nquota_ub(cgrp, cgx);
 	cgx->runtime_total_sloppy = 0;
 	cgx->budget_remaining = (cgrp->level == 1)? cgx->nquota : 0;

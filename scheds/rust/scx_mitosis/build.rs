@@ -8,6 +8,10 @@ fn main() {
         .unwrap()
         .enable_intf("src/bpf/intf.h", "bpf_intf.rs")
         .enable_skel("src/bpf/mitosis.bpf.c", "bpf")
-        .build()
+        .add_source("../../../lib/atq.bpf.c")
+        .add_source("../../../lib/cgroup_bw.bpf.c")
+        .add_source("../../../lib/minheap.bpf.c")
+        .add_source("../../../lib/sdt_alloc.bpf.c")
+        .compile_link_gen()
         .unwrap();
 }

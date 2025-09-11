@@ -23,6 +23,8 @@
 #include <scx/ravg_impl.bpf.h>
 #endif
 
+#include <lib/cgroup.h>
+
 char _license[] SEC("license") = "GPL";
 
 /*
@@ -1080,6 +1082,14 @@ int BPF_PROG(fentry_cpuset_write_resmask, struct kernfs_open_file *of,
 s32 BPF_STRUCT_OPS(mitosis_cgroup_init, struct cgroup *cgrp,
 		   struct scx_cgroup_init_args *args)
 {
+	if (cgrp->kn->id == 5552184) {
+		int ret = scx_cgroup_bw_init(cgrp, args);
+		if (ret) {
+			scx_bpf_error("scx_cgroup_bw_init failed: %d", ret);
+			return ret;
+		}
+	}
+
 	struct cgrp_ctx *cgc;
 	if (!(cgc = bpf_cgrp_storage_get(&cgrp_ctxs, cgrp, 0,
 					 BPF_LOCAL_STORAGE_GET_F_CREATE))) {
@@ -1125,6 +1135,14 @@ s32 BPF_STRUCT_OPS(mitosis_cgroup_init, struct cgroup *cgrp,
 
 s32 BPF_STRUCT_OPS(mitosis_cgroup_exit, struct cgroup *cgrp)
 {
+	if (cgrp->kn->id == 5552184) {
+		int ret = scx_cgroup_bw_exit(cgrp);
+		if (ret) {
+			scx_bpf_error("scx_cgroup_bw_exit failed: %d", ret);
+			return ret;
+		}
+	}
+
 	struct cgrp_ctx *cgc;
 	if (!(cgc = bpf_cgrp_storage_get(&cgrp_ctxs, cgrp, 0,
 					 BPF_LOCAL_STORAGE_GET_F_CREATE))) {
@@ -1392,6 +1410,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mitosis_init)
 	}
 
 	cells[0].in_use = true;
+
+	struct scx_cgroup_bw_config cfg;
+	cfg.budget_p2c = 100000;
+	cfg.budget_c2l = 100000;
+	cfg.nr_llcs = 1;
+	cfg.verbose = 1000;
+	scx_cgroup_bw_lib_init(&cfg);
 	return 0;
 }
 
@@ -1399,6 +1424,13 @@ void BPF_STRUCT_OPS(mitosis_exit, struct scx_exit_info *ei)
 {
 	UEI_RECORD(uei, ei);
 }
+
+int mitosis_enqueue_cb(pid_t pid)
+{
+	scx_bpf_error("NYI");
+	return 0;
+}
+REGISTER_SCX_CGROUP_BW_ENQUEUE_CB(mitosis_enqueue_cb);
 
 SEC(".struct_ops.link")
 struct sched_ext_ops mitosis = {
