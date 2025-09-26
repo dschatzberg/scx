@@ -1080,6 +1080,8 @@ int BPF_PROG(fentry_cpuset_write_resmask, struct kernfs_open_file *of,
 s32 BPF_STRUCT_OPS(mitosis_cgroup_init, struct cgroup *cgrp,
 		   struct scx_cgroup_init_args *args)
 {
+	bpf_printk("<cgroup_init> %llu\n", cgrp->kn->id);
+
 	struct cgrp_ctx *cgc;
 	if (!(cgc = bpf_cgrp_storage_get(&cgrp_ctxs, cgrp, 0,
 					 BPF_LOCAL_STORAGE_GET_F_CREATE))) {
@@ -1125,6 +1127,8 @@ s32 BPF_STRUCT_OPS(mitosis_cgroup_init, struct cgroup *cgrp,
 
 s32 BPF_STRUCT_OPS(mitosis_cgroup_exit, struct cgroup *cgrp)
 {
+	bpf_printk("<cgroup_exit> %llu\n", cgrp->kn->id);
+
 	struct cgrp_ctx *cgc;
 	if (!(cgc = bpf_cgrp_storage_get(&cgrp_ctxs, cgrp, 0,
 					 BPF_LOCAL_STORAGE_GET_F_CREATE))) {
@@ -1180,6 +1184,8 @@ s32 BPF_STRUCT_OPS(mitosis_init_task, struct task_struct *p,
 {
 	struct task_ctx *tctx;
 	struct bpf_cpumask *cpumask;
+
+	bpf_printk("<init_task> pid(%d) cgrp(%llu)\n", p->pid, args->cgroup->kn->id);
 
 	tctx = bpf_task_storage_get(&task_ctxs, p, 0,
 				    BPF_LOCAL_STORAGE_GET_F_CREATE);
